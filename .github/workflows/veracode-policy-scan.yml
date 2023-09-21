@@ -1,0 +1,92 @@
+# Veracode Policy Scan workflow. Requires the following secrets:
+# VERACODE_API_ID - https://help.veracode.com/r/t_create_api_creds
+# VERACODE_API_KEY - https://help.veracode.com/r/t_create_api_creds
+
+name: Veracode Policy Scan
+
+# Controls when the action will run. Triggers the workflow on push or pull request
+# events but only for the master branch
+on:
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build-and-policy-scan:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
+      - uses: actions/setup-java@v1 # Make java accessible on path so the uploadandscan action can run.
+        with: 
+          java-version: '8'
+          
+      # zip the project and move it to a staging directory
+      - name: Zip Project
+        run: zip -R project.zip '*.py' '*.html' '*.htm' '*.js' '*.php' 'requirements.txt' '*.json' '*.lock' '*.ts' '*.pl' '*.pm' '*.plx' '*.pl5' '*.cgi' '*.go' '*.sum' '*.mod'
+        env:
+          build-name: project.zip
+      - uses: actions/upload-artifact@v2 # Copy files from repository to docker container so the next uploadandscan action can access them.
+        with:
+          path: project.zip # Wildcards can be used to filter the files copied into the container. See: https://github.com/actions/upload-artifact
+      - uses: veracode/veracode-uploadandscan-action@master # Run the uploadandscan action. Inputs are described above.
+        with:
+          appname: '${{ github.event.repository.name }}'
+          filepath: 'project.zip'
+          vid: '${{ secrets.VERACODE_API_ID }}'
+          vkey: '${{ secrets.VERACODE_API_KEY }}'
+          scantimeout: 30
+        continue-on-error: true
+        
+# this first step will get existing flaws for an Application Profile (in this case, NodeGoat).  
+# 	(obviously) Change the name=<app_name> in the first http call to be 
+#	the name of your Application on the Veracode platform
+  get-policy-flaws:
+    needs:  build-and-policy-scan
+    runs-on: ubuntu-latest
+    container: 
+      image: veracode/api-signing:latest
+      options: --user root # our normal luser
+    steps:
+      # Note: this will only work up to about 500 flaws
+      #		due to Veracode results limiting
+      # See the get_flaws.sh script in the helpers directory
+      #		for a more elaborate method
+      - name: get policy flaws
+        run: |
+          cd /tmp
+          export VERACODE_API_KEY_ID=${{ secrets.VERACODE_API_ID }}
+          export VERACODE_API_KEY_SECRET=${{ secrets.VERACODE_API_KEY }}
+          export APP_NAME=${{ github.event.repository.name }}
+          echo APP_NAME: ${APP_NAME}
+          guid=$(http --auth-type veracode_hmac GET "https://api.veracode.com/appsec/v1/applications?name=${APP_NAME}" | jq -r '._embedded.applications[0].guid') 
+          echo GUID: ${guid}
+          total_flaws=$(http --auth-type veracode_hmac GET "https://api.veracode.com/appsec/v2/applications/${guid}/findings?scan_type=STATIC&violates_policy=True" | jq -r '.page.total_elements')
+          echo TOTAL_FLAWS: ${total_flaws}
+          http --auth-type veracode_hmac GET "https://api.veracode.com/appsec/v2/applications/${guid}/findings?scan_type=STATIC&violates_policy=True&size=${total_flaws}" > policy_flaws.json
+
+      - name: save results file
+        uses: actions/upload-artifact@v2
+        with:
+          name: policy-flaws
+          path: /tmp/policy_flaws.json
+
+# This step will import flaws from the step above
+  import-policy-flaws:
+    needs: get-policy-flaws
+    runs-on: ubuntu-latest
+    steps:
+      - name: get flaw file
+        uses: actions/download-artifact@v2
+        with:
+          name: policy-flaws
+          path: /tmp
+
+      - name: import flaws as issues
+        uses: buzzcode/veracode-flaws-to-issues@v1
+        with:
+          scan-results-json: '/tmp/policy_flaws.json'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
