@@ -10,9 +10,6 @@ name: Veracode Static Analysis Pipeline Scan
 # events but only for the master branch
 on:
   push:
-    branches:
-      - master
-      - main      
   pull_request:
     branches:
       - master
